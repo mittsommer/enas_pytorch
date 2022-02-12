@@ -1,13 +1,13 @@
 import os
 import sys
 import time
-import visdom
+
 import argparse
 import numpy as np
-
+import wandb
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
+
 from torchvision import datasets, transforms
 from torch.utils.data.dataset import Subset
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -19,6 +19,7 @@ from utils.cutout import Cutout
 
 parser = argparse.ArgumentParser(description='ENAS')
 
+parser.add_argument('--num_workers', default=0, type=int)
 parser.add_argument('--search_for', default='macro', choices=['macro'])
 parser.add_argument('--data_path', default='/export/mlrg/terrance/Projects/data/', type=str)
 parser.add_argument('--output_filename', default='ENAS', type=str)
@@ -56,10 +57,7 @@ parser.add_argument('--controller_bl_dec', type=float, default=0.99)
 
 args = parser.parse_args()
 
-vis = visdom.Visdom()
-vis.env = 'ENAS_' + args.output_filename
-vis_win = {'shared_cnn_acc': None, 'shared_cnn_loss': None, 'controller_reward': None,
-           'controller_acc': None, 'controller_loss': None}
+wandb.init(project="PaNAS", entity="kai-liang", config=args)
 
 
 def load_datasets():
@@ -109,31 +107,27 @@ def load_datasets():
     train_subset = Subset(train_dataset, train_indices)
     valid_subset = Subset(valid_dataset, valid_indices)
 
-    data_loaders = {}
-    data_loaders['train_subset'] = torch.utils.data.DataLoader(dataset=train_subset,
-                                                               batch_size=args.batch_size,
-                                                               shuffle=True,
-                                                               pin_memory=True,
-                                                               num_workers=2)
-
-    data_loaders['valid_subset'] = torch.utils.data.DataLoader(dataset=valid_subset,
-                                                               batch_size=args.batch_size,
-                                                               shuffle=True,
-                                                               pin_memory=True,
-                                                               num_workers=2,
-                                                               drop_last=True)
-
-    data_loaders['train_dataset'] = torch.utils.data.DataLoader(dataset=train_dataset,
+    data_loaders = {'train_subset': torch.utils.data.DataLoader(dataset=train_subset,
                                                                 batch_size=args.batch_size,
                                                                 shuffle=True,
                                                                 pin_memory=True,
-                                                                num_workers=2)
-
-    data_loaders['test_dataset'] = torch.utils.data.DataLoader(dataset=test_dataset,
-                                                               batch_size=args.batch_size,
-                                                               shuffle=False,
-                                                               pin_memory=True,
-                                                               num_workers=2)
+                                                                num_workers=args.num_workers),
+                    'valid_subset': torch.utils.data.DataLoader(dataset=valid_subset,
+                                                                batch_size=args.batch_size,
+                                                                shuffle=True,
+                                                                pin_memory=True,
+                                                                num_workers=args.num_workers,
+                                                                drop_last=True),
+                    'train_dataset': torch.utils.data.DataLoader(dataset=train_dataset,
+                                                                 batch_size=args.batch_size,
+                                                                 shuffle=True,
+                                                                 pin_memory=True,
+                                                                 num_workers=args.num_workers),
+                    'test_dataset': torch.utils.data.DataLoader(dataset=test_dataset,
+                                                                batch_size=args.batch_size,
+                                                                shuffle=False,
+                                                                pin_memory=True,
+                                                                num_workers=args.num_workers)}
 
     return data_loaders
 
@@ -154,10 +148,9 @@ def train_shared_cnn(epoch,
         shared_cnn_optimizer: Optimizer for the shared_cnn.
         fixed_arc: Architecture to train, overrides the controller sample
         ...
-    
+
     Returns: Nothing.
     """
-    global vis_win
 
     controller.eval()
 
@@ -207,20 +200,13 @@ def train_shared_cnn(epoch,
                       '\tacc=%.4f' % (train_acc_meter.val) + \
                       '\ttime=%.2fit/s' % (1. / (end - start))
             print(display)
-
-    vis_win['shared_cnn_acc'] = vis.line(
-        X=np.array([epoch]),
-        Y=np.array([train_acc_meter.avg]),
-        win=vis_win['shared_cnn_acc'],
-        opts=dict(title='shared_cnn_acc', xlabel='Iteration', ylabel='Accuracy'),
-        update='append' if epoch > 0 else None)
-
-    vis_win['shared_cnn_loss'] = vis.line(
-        X=np.array([epoch]),
-        Y=np.array([loss_meter.avg]),
-        win=vis_win['shared_cnn_loss'],
-        opts=dict(title='shared_cnn_loss', xlabel='Iteration', ylabel='Loss'),
-        update='append' if epoch > 0 else None)
+        wandb.log({
+            'shared CNN train loss': loss_meter.val,
+            'shared CNN train accuracy': train_acc_meter.val,
+            "shared CNN train step": epoch * len(train_loader) + i,
+            'shared CNN train grad norm': grad_norm.item(),
+            'shared CNN learning rate': shared_cnn_optimizer.param_groups[0]['lr']
+        })
 
     controller.train()
 
@@ -240,22 +226,20 @@ def train_controller(epoch,
         data_loaders: Dict containing data loaders.
         controller_optimizer: Optimizer for the controller.
         baseline: The baseline score (i.e. average val_acc) from the previous epoch
-    
-    Returns: 
+
+    Returns:
         baseline: The baseline score (i.e. average val_acc) for the current epoch
 
     For more stable training we perform weight updates using the average of
     many gradient estimates. controller_num_aggregate indicates how many samples
     we want to average over (default = 20). By default PyTorch will sum gradients
     each time .backward() is called (as long as an optimizer step is not taken),
-    so each iteration we divide the loss by controller_num_aggregate to get the 
+    so each iteration we divide the loss by controller_num_aggregate to get the
     average.
 
     https://github.com/melodyguan/enas/blob/master/src/cifar10/general_controller.py#L270
     """
     print('Epoch ' + str(epoch) + ': Training controller')
-
-    global vis_win
 
     shared_cnn.eval()
     valid_loader = data_loaders['valid_subset']
@@ -325,27 +309,15 @@ def train_controller(epoch,
                           '\ttime=%.2fit/s' % (1. / (end - start))
                 print(display)
 
-    vis_win['controller_reward'] = vis.line(
-        X=np.column_stack([epoch] * 2),
-        Y=np.column_stack([reward_meter.avg, baseline_meter.avg]),
-        win=vis_win['controller_reward'],
-        opts=dict(title='controller_reward', xlabel='Iteration', ylabel='Reward'),
-        update='append' if epoch > 0 else None)
-
-    vis_win['controller_acc'] = vis.line(
-        X=np.array([epoch]),
-        Y=np.array([val_acc_meter.avg]),
-        win=vis_win['controller_acc'],
-        opts=dict(title='controller_acc', xlabel='Iteration', ylabel='Accuracy'),
-        update='append' if epoch > 0 else None)
-
-    vis_win['controller_loss'] = vis.line(
-        X=np.array([epoch]),
-        Y=np.array([loss_meter.avg]),
-        win=vis_win['controller_loss'],
-        opts=dict(title='controller_loss', xlabel='Iteration', ylabel='Loss'),
-        update='append' if epoch > 0 else None)
-
+        wandb.log({
+            'controller loss': loss_meter.val,
+            'controller ent': controller.sample_entropy.item(),
+            'controller lr': controller_optimizer.param_groups[0]['lr'],
+            'controller |g|': grad_norm.item(),
+            'controller acc': val_acc_meter.val,
+            'baseline': baseline_meter.val,
+            "train controller step": epoch * args.controller_num_aggregate * args.controller_train_steps + i
+        })
     shared_cnn.train()
     return baseline
 
@@ -359,7 +331,7 @@ def evaluate_model(epoch, controller, shared_cnn, data_loaders, n_samples=10):
         shared_cnn: CNN that contains all possible architectures, with shared weights.
         data_loaders: Dict containing data loaders.
         n_samples: Number of architectures to test when looking for the best one.
-    
+
     Returns: Nothing.
     """
 
@@ -379,6 +351,10 @@ def evaluate_model(epoch, controller, shared_cnn, data_loaders, n_samples=10):
     print('valid_accuracy: %.4f' % (valid_acc))
     print('test_accuracy: %.4f' % (test_acc))
 
+    wandb.log({"valid accuracy": valid_acc,
+               "test accuracy": test_acc,
+               "evaluate epoch": epoch})
+
     controller.train()
     shared_cnn.train()
 
@@ -392,7 +368,7 @@ def get_best_arc(controller, shared_cnn, data_loaders, n_samples=10, verbose=Fal
         data_loaders: Dict containing data loaders.
         n_samples: Number of architectures to test when looking for the best one.
         verbose: If True, display the architecture and resulting validation accuracy.
-    
+
     Returns:
         best_arc: The best performing architecture.
         best_vall_acc: Accuracy achieved on the best performing architecture.
@@ -443,7 +419,7 @@ def get_eval_accuracy(loader, shared_cnn, sample_arc):
         loader: A single data loader.
         shared_cnn: CNN that contains all possible architectures, with shared weights.
         sample_arc: The architecture to use for the evaluation.
-    
+
     Returns:
         acc: Average accuracy.
     """
@@ -464,8 +440,8 @@ def get_eval_accuracy(loader, shared_cnn, sample_arc):
 
 def print_arc(sample_arc):
     """Display a sample architecture in a readable format.
-    
-    Args: 
+
+    Args:
         sample_arc: The architecture to display.
 
     Returns: Nothing.
@@ -497,7 +473,7 @@ def train_enas(start_epoch,
         shared_cnn_optimizer: Optimizer for the shared_cnn.
         controller_optimizer: Optimizer for the controller.
         shared_cnn_scheduler: Learning rate schedular for shared_cnn_optimizer
-    
+
     Returns: Nothing.
     """
 
@@ -543,7 +519,7 @@ def train_fixed(start_epoch,
         controller: Controller module that generates architectures to be trained.
         shared_cnn: CNN that contains all possible architectures, with shared weights.
         data_loaders: Dict containing data loaders.
-    
+
     Returns: Nothing.
 
     Given a fully trained controller and shared_cnn, we sample many architectures,
@@ -589,6 +565,9 @@ def train_fixed(start_epoch,
             test_acc = get_eval_accuracy(test_loader, fixed_cnn, best_arc)
             print('Epoch ' + str(epoch) + ': Eval')
             print('test_accuracy: %.4f' % (test_acc))
+
+        wandb.log({"fixed test accuracy": test_acc,
+                   "epoch": epoch})
 
         fixed_cnn_scheduler.step(epoch)
 
