@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from torchvision import datasets, transforms
 from torch.utils.data.dataset import Subset
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 
 from models.controller import Controller
 from models.shared_cnn import SharedCNN
@@ -21,7 +21,7 @@ parser = argparse.ArgumentParser(description='ENAS')
 
 parser.add_argument('--num_workers', default=0, type=int)
 parser.add_argument('--search_for', default='macro', choices=['macro'])
-parser.add_argument('--data_path', default='/export/mlrg/terrance/Projects/data/', type=str)
+parser.add_argument('--data_path', default='data', type=str)
 parser.add_argument('--output_filename', default='ENAS', type=str)
 parser.add_argument('--resume', default='', type=str)
 parser.add_argument('--batch_size', type=int, default=128)
@@ -40,7 +40,10 @@ parser.add_argument('--child_num_branches', type=int, default=6)
 parser.add_argument('--child_keep_prob', type=float, default=0.9)
 parser.add_argument('--child_lr_max', type=float, default=0.05)
 parser.add_argument('--child_lr_min', type=float, default=0.0005)
-parser.add_argument('--child_lr_T', type=float, default=10)
+parser.add_argument('--child_lr_T_0', type=int, default=10)
+parser.add_argument('--child_lr_T_mult', type=int, default=2)
+parser.add_argument('--child_extend', action='store_true', default=False)
+parser.add_argument('--child_extend_filters', type=int, default=512)
 
 parser.add_argument('--controller_lstm_size', type=int, default=64)
 parser.add_argument('--controller_lstm_num_layers', type=int, default=1)
@@ -264,17 +267,19 @@ def train_controller(epoch,
         val_acc = torch.mean((torch.max(pred, 1)[1] == labels).type(torch.float))
 
         # detach to make sure that gradients aren't backpropped through the reward
-        reward = torch.tensor(val_acc.detach())
+        reward = val_acc.clone().detach()
+
         reward += args.controller_entropy_weight * controller.sample_entropy
 
         if baseline is None:
             baseline = val_acc
+            baseline = torch.tensor(0.0).cuda()
         else:
             baseline -= (1 - args.controller_bl_dec) * (baseline - reward)
             # detach to make sure that gradients are not backpropped through the baseline
             baseline = baseline.detach()
 
-        loss = -1 * controller.sample_log_prob * (reward - baseline)
+        loss = controller.sample_log_prob * (reward - baseline)
 
         if args.controller_skip_weight is not None:
             loss += args.controller_skip_weight * controller.skip_penaltys
@@ -311,12 +316,11 @@ def train_controller(epoch,
 
         wandb.log({
             'controller loss': loss_meter.val,
-            'controller ent': controller.sample_entropy.item(),
-            'controller lr': controller_optimizer.param_groups[0]['lr'],
-            'controller |g|': grad_norm.item(),
-            'controller acc': val_acc_meter.val,
+            'controller entropy': controller.sample_entropy.item(),
+            'controller learning rate': controller_optimizer.param_groups[0]['lr'],
+            'controller accuracy': val_acc_meter.val,
             'baseline': baseline_meter.val,
-            "train controller step": epoch * args.controller_num_aggregate * args.controller_train_steps + i
+            "controller train step": epoch * args.controller_num_aggregate * args.controller_train_steps + i
         })
     shared_cnn.train()
     return baseline
@@ -397,6 +401,53 @@ def get_best_arc(controller, shared_cnn, data_loaders, n_samples=10, verbose=Fal
             pred = shared_cnn(images, sample_arc)
         val_acc = torch.mean((torch.max(pred, 1)[1] == labels).type(torch.float))
         val_accs.append(val_acc.item())
+
+        if verbose:
+            print_arc(sample_arc)
+            print('val_acc=' + str(val_acc.item()))
+            print('-' * 80)
+
+    best_iter = np.argmax(val_accs)
+    best_arc = arcs[best_iter]
+    best_val_acc = val_accs[best_iter]
+
+    controller.train()
+    shared_cnn.train()
+    return best_arc, best_val_acc
+
+
+def get_best_arc_fixed(controller, shared_cnn, data_loaders, n_samples=100, verbose=False):
+    """Evaluate several architectures and return the best performing one.
+
+    Args:
+        controller: Controller module that generates architectures to be trained.
+        shared_cnn: CNN that contains all possible architectures, with shared weights.
+        data_loaders: Dict containing data loaders.
+        n_samples: Number of architectures to test when looking for the best one.
+        verbose: If True, display the architecture and resulting validation accuracy.
+
+    Returns:
+        best_arc: The best performing architecture.
+        best_vall_acc: Accuracy achieved on the best performing architecture.
+
+    All architectures are evaluated on the same minibatch from the validation set.
+    """
+
+    controller.eval()
+    shared_cnn.eval()
+
+    valid_loader = data_loaders['valid_subset']
+
+    arcs = []
+    val_accs = []
+    for i in range(n_samples):
+        with torch.no_grad():
+            controller()  # perform forward pass to generate a new architecture
+        sample_arc = controller.sample_arc
+        arcs.append(sample_arc)
+
+        val_acc = get_eval_accuracy(valid_loader, shared_cnn, sample_arc)
+        val_accs.append(val_acc)
 
         if verbose:
             print_arc(sample_arc)
@@ -528,16 +579,22 @@ def train_fixed(start_epoch,
     has 512 channels.
     """
 
-    best_arc, best_val_acc = get_best_arc(controller, shared_cnn, data_loaders, n_samples=100, verbose=False)
+    best_arc, best_val_acc = get_best_arc_fixed(controller, shared_cnn, data_loaders, n_samples=100, verbose=False)
     print('Best architecture:')
     print_arc(best_arc)
     print('Validation accuracy: ' + str(best_val_acc))
-
-    fixed_cnn = SharedCNN(num_layers=args.child_num_layers,
-                          num_branches=args.child_num_branches,
-                          out_filters=512 // 4,  # args.child_out_filters
-                          keep_prob=args.child_keep_prob,
-                          fixed_arc=best_arc)
+    if args.child_extend:
+        fixed_cnn = SharedCNN(num_layers=args.child_num_layers,
+                              num_branches=args.child_num_branches,
+                              out_filters=args.child_extend_filters,
+                              keep_prob=args.child_keep_prob,
+                              fixed_arc=best_arc)
+    else:
+        fixed_cnn = SharedCNN(num_layers=args.child_num_layers,
+                              num_branches=args.child_num_branches,
+                              out_filters=args.child_out_filters,
+                              keep_prob=args.child_keep_prob,
+                              fixed_arc=best_arc)
     fixed_cnn = fixed_cnn.cuda()
 
     fixed_cnn_optimizer = torch.optim.SGD(params=fixed_cnn.parameters(),
@@ -546,9 +603,10 @@ def train_fixed(start_epoch,
                                           nesterov=True,
                                           weight_decay=args.child_l2_reg)
 
-    fixed_cnn_scheduler = CosineAnnealingLR(optimizer=fixed_cnn_optimizer,
-                                            T_max=args.child_lr_T,
-                                            eta_min=args.child_lr_min)
+    fixed_cnn_scheduler = CosineAnnealingWarmRestarts(optimizer=fixed_cnn_optimizer,
+                                                      T_0=args.child_lr_T_0,
+                                                      T_mult=args.child_lr_T_mult,
+                                                      eta_min=args.child_lr_min)
 
     test_loader = data_loaders['test_dataset']
 
@@ -576,7 +634,10 @@ def train_fixed(start_epoch,
                  'best_arc': best_arc,
                  'fixed_cnn_state_dict': shared_cnn.state_dict(),
                  'fixed_cnn_optimizer': fixed_cnn_optimizer.state_dict()}
-        filename = 'checkpoints/' + args.output_filename + '_fixed.pth.tar'
+        if args.child_extend_filters:
+            filename = 'checkpoints/' + args.output_filename + '_fixed_extend_{}.pth.tar'.format(args.child_extend_filters)
+        else:
+            filename = 'checkpoints/' + args.output_filename + '_fixed.pth.tar'
         torch.save(state, filename)
 
 
@@ -587,7 +648,11 @@ def main():
     torch.cuda.manual_seed(args.seed)
 
     if args.fixed_arc:
-        sys.stdout = Logger(filename='logs/' + args.output_filename + '_fixed.log')
+        if args.child_extend:
+            sys.stdout = Logger(
+                filename='logs/' + args.output_filename + '_fixed_extend_{}.log'.format(args.child_extend_filters))
+        else:
+            sys.stdout = Logger(filename='logs/' + args.output_filename + '_fixed.log')
     else:
         sys.stdout = Logger(filename='logs/' + args.output_filename + '.log')
 
@@ -628,9 +693,10 @@ def main():
                                            weight_decay=args.child_l2_reg)
 
     # https://github.com/melodyguan/enas/blob/master/src/utils.py#L154
-    shared_cnn_scheduler = CosineAnnealingLR(optimizer=shared_cnn_optimizer,
-                                             T_max=args.child_lr_T,
-                                             eta_min=args.child_lr_min)
+    shared_cnn_scheduler = CosineAnnealingWarmRestarts(optimizer=shared_cnn_optimizer,
+                                                       T_0=args.child_lr_T_0,
+                                                       T_mult=args.child_lr_T_mult,
+                                                       eta_min=args.child_lr_min)
 
     if args.resume:
         if os.path.isfile(args.resume):

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 from torch.distributions.categorical import Categorical
-
+import torch.nn.functional as F
 
 class Controller(nn.Module):
     '''
@@ -16,7 +16,7 @@ class Controller(nn.Module):
                  out_filters=36,
                  lstm_size=32,
                  lstm_num_layers=2,
-                 tanh_constant=1.5,
+                 tanh_constant=2.5,
                  temperature=None,
                  skip_target=0.4,
                  skip_weight=0.8):
@@ -42,6 +42,7 @@ class Controller(nn.Module):
         '''
         https://github.com/melodyguan/enas/blob/master/src/cifar10/general_controller.py#L83
         '''
+        # initial lstm
         self.w_lstm = nn.LSTM(input_size=self.lstm_size,
                               hidden_size=self.lstm_size,
                               num_layers=self.lstm_num_layers)
@@ -104,9 +105,10 @@ class Controller(nn.Module):
 
                 arc_seq[str(layer_id)] = [branch_id]
 
-                log_prob = branch_id_dist.log_prob(branch_id)
+                log_prob = -branch_id_dist.log_prob(branch_id)
                 log_probs.append(log_prob.view(-1))
-                entropy = branch_id_dist.entropy()
+                # entropy = branch_id_dist.entropy()
+                entropy = log_prob * torch.exp(-log_prob)
                 entropys.append(entropy.view(-1))
 
                 inputs = self.w_emb(branch_id)
@@ -138,12 +140,12 @@ class Controller(nn.Module):
                 kl = skip_prob * torch.log(skip_prob / skip_targets)
                 kl = torch.sum(kl)
                 skip_penaltys.append(kl)
+                log_prob = -skip_dist.log_prob(skip)
+                # log_prob = torch.sum(log_prob)
+                log_probs.append(log_prob.sum().view(-1))
 
-                log_prob = skip_dist.log_prob(skip)
-                log_prob = torch.sum(log_prob)
-                log_probs.append(log_prob.view(-1))
-
-                entropy = skip_dist.entropy()
+                # entropy = skip_dist.entropy()
+                entropy = log_prob * torch.exp(-log_prob)
                 entropy = torch.sum(entropy)
                 entropys.append(entropy.view(-1))
 
